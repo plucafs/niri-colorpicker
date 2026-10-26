@@ -5,10 +5,11 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
+use std::time::Instant;
 
 const MAX_COLORS: usize = 50;
 const UI_ZOOM: f32 = 1.3;
-
+const FLASH_DURATION: f32 = 0.45;
 fn niri_focused_window_id() -> Option<u64> {
     let output = Command::new("niri")
         .args(["msg", "--json", "focused-window"])
@@ -176,7 +177,20 @@ fn rgb_to_hsl(r: u8, g: u8, b: u8) -> (u32, u32, u32) {
     )
 }
 
-fn draw_swatch(ui: &mut egui::Ui, id: egui::Id, color: [u8; 3], box_size: f32) -> (bool, bool) {
+enum MenuAction {
+    Copy,
+    MoveTop,
+    Edit,
+    Delete,
+}
+
+fn draw_swatch(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    color: [u8; 3],
+    box_size: f32,
+    flash: Option<f32>,
+) -> egui::Response {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(box_size, box_size), egui::Sense::click());
     let response = ui.interact(rect, id, egui::Sense::click());
 
@@ -192,15 +206,27 @@ fn draw_swatch(ui: &mut egui::Ui, id: egui::Id, color: [u8; 3], box_size: f32) -
         );
     }
 
-    (response.clicked(), response.secondary_clicked())
+    if let Some(p) = flash {
+        let alpha = (255.0 * p) as u8;
+        painter.rect_stroke(
+            rect,
+            4.0,
+            egui::Stroke::new(3.0_f32, egui::Color32::from_white_alpha(alpha)),
+            egui::StrokeKind::Inside,
+        );
+    }
+
+    response
 }
 
 struct App {
     palette: PaletteData,
-    status: String,
     receiver: Option<mpsc::Receiver<String>>,
     clipboard: Box<dyn ClipboardBackend>,
     editing_color: Option<usize>,
+    edit_gen: u32,
+    context_menu: Option<(usize, egui::Pos2)>,
+    flash: Option<(usize, Instant)>,
     ui_initialized: bool,
     startup_focus: Option<u64>,
 }
@@ -210,17 +236,19 @@ impl App {
         let palette = Self::load_colors();
         Self {
             palette,
-            status: String::new(),
             receiver: None,
             clipboard: Box::new(WlCopyBackend),
             editing_color: None,
+            edit_gen: 0,
+            context_menu: None,
+            flash: None,
             ui_initialized: false,
             startup_focus,
         }
     }
 
     fn config_path() -> Option<PathBuf> {
-        dirs::config_dir().map(|p| p.join("niri-color-picker").join("colors.json"))
+        dirs::config_dir().map(|p| p.join("niri-colorpicker").join("colors.json"))
     }
 
     fn load_colors() -> PaletteData {
@@ -253,7 +281,6 @@ impl App {
         }
         let (tx, rx) = mpsc::channel();
         self.receiver = Some(rx);
-        self.status = "Picking...".into();
         ctx.send_viewport_cmd(egui::ViewportCommand::Transparent(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
 
@@ -298,10 +325,56 @@ impl App {
     }
 
     fn copy_color(&mut self, color: [u8; 3]) {
-        let text = format_color(color, &self.palette.format);
-        match self.clipboard.set_text(&text) {
-            Ok(_) => self.status = format!("Copied: {}", text),
-            Err(e) => self.status = format!("Clipboard error: {}", e),
+        if self.clipboard.set_text(&format_color(color, &self.palette.format)).is_ok() {
+            self.flash = self
+                .palette
+                .colors
+                .iter()
+                .position(|&c| c == color)
+                .map(|i| (i, Instant::now()));
+        }
+    }
+
+    // After a color is removed from palette.colors at `removed`, the indexes
+    // used by the editor and the flash get shifted by one above it.
+    fn remap_after_removal(&mut self, removed: usize) {
+        if let Some(e) = self.editing_color {
+            if e == removed {
+                self.editing_color = None;
+            } else if e > removed {
+                self.editing_color = Some(e - 1);
+            }
+        }
+        self.flash = self.flash.and_then(|(i, at)| match i.cmp(&removed) {
+            std::cmp::Ordering::Equal => None,
+            std::cmp::Ordering::Greater => Some((i - 1, at)),
+            std::cmp::Ordering::Less => Some((i, at)),
+        });
+    }
+
+    // After the color at `moved` is moved to the top, indexes before it shift
+    // down by one and the color itself is at index 0.
+    fn remap_after_move_to_top(&mut self, moved: usize) {
+        if let Some(e) = self.editing_color {
+            self.editing_color = if e == moved {
+                Some(0)
+            } else if e < moved {
+                Some(e + 1)
+            } else {
+                Some(e)
+            };
+        }
+        if let Some((i, at)) = self.flash {
+            self.flash = Some((
+                if i == moved {
+                    0
+                } else if i < moved {
+                    i + 1
+                } else {
+                    i
+                },
+                at,
+            ));
         }
     }
 }
@@ -342,7 +415,7 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Transparent(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
             if output.starts_with("Error:") || output.starts_with("Command error:") {
-                self.status = output;
+                // The pick thread reports the failure; there is nothing to copy.
             } else if let Some(color) = Self::parse_color(&output) {
                 self.copy_color(color);
                 if let Some(pos) = self.palette.colors.iter().position(|&c| c == color) {
@@ -353,8 +426,6 @@ impl eframe::App for App {
                     self.palette.colors.pop();
                 }
                 self.save_colors();
-            } else {
-                self.status = format!("Parse error: {}", output);
             }
         }
 
@@ -411,20 +482,28 @@ impl eframe::App for App {
             ui.add_space(4.0);
         });
 
-        egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
-            ui.add_space(4.0);
-            if !self.status.is_empty() {
-                ui.label(egui::RichText::new(&self.status).small().weak());
-            }
-            ui.add_space(4.0);
-        });
-
         let box_size = 28.0;
         let featured_size = 40.0;
         let gap = 8.0;
 
         let mut clicked_color: Option<[u8; 3]> = None;
         let mut rmb_index: Option<usize> = None;
+        let mut rmb_pos: Option<egui::Pos2> = None;
+
+        let flash_snapshot: Option<(usize, f32)> = self
+            .flash
+            .map(|(i, at)| (i, at.elapsed().as_secs_f32()))
+            .filter(|(_, el)| *el < FLASH_DURATION);
+        let flash_progress = |idx: usize| -> Option<f32> {
+            flash_snapshot.as_ref().and_then(|(fi, el)| {
+                if *fi == idx {
+                    let p = (FLASH_DURATION - el) / FLASH_DURATION;
+                    (p > 0.0).then_some(p)
+                } else {
+                    None
+                }
+            })
+        };
 
         egui::CentralPanel::default().show(ctx, |ui| {
             let colors = self.palette.colors.clone();
@@ -460,13 +539,23 @@ impl eframe::App for App {
 
             // Featured row: the most recent color, alone in its row above the rest.
             ui.horizontal(|ui| {
-                let (clicked, secondary) =
-                    draw_swatch(ui, egui::Id::new(("color", 0usize)), colors[0], featured_size);
-                if clicked {
+                let response = draw_swatch(
+                    ui,
+                    egui::Id::new(("color", 0usize)),
+                    colors[0],
+                    featured_size,
+                    flash_progress(0),
+                );
+                if response.clicked() {
                     clicked_color = Some(colors[0]);
                 }
-                if secondary {
+                if response.secondary_clicked() {
                     rmb_index = Some(0);
+                    rmb_pos = Some(
+                        response
+                            .interact_pointer_pos()
+                            .unwrap_or_else(|| ui.cursor().min),
+                    );
                 }
 
                 ui.label(
@@ -476,6 +565,8 @@ impl eframe::App for App {
                         .color(text_color),
                 );
             });
+
+            ui.separator();
 
             if colors.len() > 1 {
                 let cell_width = box_size + 6.0 + label_width;
@@ -495,17 +586,23 @@ impl eframe::App for App {
                                     }
 
                                     ui.horizontal(|ui| {
-                                        let (clicked, secondary) = draw_swatch(
+                                        let response = draw_swatch(
                                             ui,
                                             egui::Id::new(("color", j + 1)),
                                             *color,
                                             box_size,
+                                            flash_progress(j + 1),
                                         );
-                                        if clicked {
+                                        if response.clicked() {
                                             clicked_color = Some(*color);
                                         }
-                                        if secondary {
+                                        if response.secondary_clicked() {
                                             rmb_index = Some(j + 1);
+                                            rmb_pos = Some(
+                                                response
+                                                    .interact_pointer_pos()
+                                                    .unwrap_or_else(|| ui.cursor().min),
+                                            );
                                         }
 
                                         ui.label(
@@ -524,13 +621,110 @@ impl eframe::App for App {
         if let Some(color) = clicked_color {
             self.copy_color(color);
         }
-        if let Some(i) = rmb_index {
-            self.editing_color = Some(i);
+        if let (Some(i), Some(pos)) = (rmb_index, rmb_pos) {
+            // A right-click on a swatch opens its context menu at the pointer.
+            self.context_menu = Some((i, pos));
+        }
+
+        // Colors vanished? Reset the context menu target.
+        if let Some((idx, _)) = self.context_menu {
+            if self.palette.colors.len() <= idx {
+                self.context_menu = None;
+            }
+        }
+
+        if let Some((idx, pos)) = self.context_menu {
+            let color = self.palette.colors[idx];
+            let mut menu_action: Option<MenuAction> = None;
+            // A right-click this frame (re)opened the menu; don't let the
+            // same click close it.
+            let reopened = rmb_index.is_some();
+
+            let area_response = egui::Area::new(egui::Id::new("color_context_menu"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(pos)
+                .show(ctx, |ui| {
+                    // Mirror egui's own menu styling (see egui::menu):
+                    // no button chrome, only a hover fill, full-width rows.
+                    {
+                        let style = ui.style_mut();
+                        style.spacing.button_padding = egui::vec2(2.0, 0.0);
+                        style.visuals.widgets.active.bg_stroke = egui::Stroke::NONE;
+                        style.visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
+                        style.visuals.widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
+                        style.visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
+                    }
+                    egui::Frame::menu(ui.style()).show(ui, |ui| {
+                        ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
+                            ui.set_min_width(120.0);
+                            if ui.button("Copy").clicked() {
+                                menu_action = Some(MenuAction::Copy);
+                            }
+                            if idx > 0 && ui.button("Move to top").clicked() {
+                                menu_action = Some(MenuAction::MoveTop);
+                            }
+                            if ui.button("Edit...").clicked() {
+                                menu_action = Some(MenuAction::Edit);
+                            }
+                            if ui
+                                .button(
+                                    egui::RichText::new("Delete")
+                                        .color(ui.visuals().error_fg_color),
+                                )
+                                .clicked()
+                            {
+                                menu_action = Some(MenuAction::Delete);
+                            }
+                        });
+                    });
+                });
+
+            // Close when clicking anywhere outside the menu.
+            let clicked_outside = ctx.input(|i| {
+                i.pointer.any_click()
+                    && !area_response
+                        .response
+                        .rect
+                        .expand(4.0)
+                        .contains(i.pointer.latest_pos().unwrap_or_default())
+            });
+            if clicked_outside && !reopened {
+                self.context_menu = None;
+            }
+
+            if let Some(action) = menu_action {
+                match action {
+                    MenuAction::Copy => {
+                        self.copy_color(color);
+                    }
+                    MenuAction::MoveTop => {
+                        let selected = self.palette.colors.remove(idx);
+                        self.palette.colors.insert(0, selected);
+                        self.remap_after_move_to_top(idx);
+                        self.save_colors();
+                    }
+                    MenuAction::Edit => {
+                        // New generation id per open: makes `default_pos`
+                        // re-center the window each time it is opened.
+                        self.edit_gen += 1;
+                        self.editing_color = Some(idx);
+                    }
+                    MenuAction::Delete => {
+                        self.palette.colors.remove(idx);
+                        self.remap_after_removal(idx);
+                        self.save_colors();
+                    }
+                }
+                self.context_menu = None;
+            }
         }
 
         if let Some(idx) = self.editing_color {
             let mut open = true;
             egui::Window::new("Edit Color")
+                .id(egui::Id::new(("edit_color", self.edit_gen)))
+                .pivot(egui::Align2::CENTER_CENTER)
+                .default_pos(ctx.screen_rect().center())
                 .resizable(false)
                 .collapsible(false)
                 .open(&mut open)
