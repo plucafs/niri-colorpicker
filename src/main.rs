@@ -1,12 +1,51 @@
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
 use std::io::Write;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 
-const MAX_COLORS: usize = 10;
+const MAX_COLORS: usize = 50;
+const UI_ZOOM: f32 = 1.3;
+
+fn niri_focused_window_id() -> Option<u64> {
+    let output = Command::new("niri")
+        .args(["msg", "--json", "focused-window"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    value.get("id")?.as_u64()
+}
+
+fn niri_focus_window(id: u64) -> bool {
+    Command::new("niri")
+        .args(["msg", "action", "focus-window", "--id", &id.to_string()])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+// niri focuses the window under the cursor even while the pick-color grab is
+// active, so put the focus back where it belongs after the pick.
+fn restore_focus(want: Option<u64>, fallback: Option<u64>) {
+    if let Some(id) = want {
+        if niri_focused_window_id() == Some(id) {
+            return;
+        }
+        if niri_focus_window(id) {
+            return;
+        }
+    }
+    if let Some(id) = fallback
+        && Some(id) != want
+    {
+        let _ = niri_focus_window(id);
+    }
+}
 
 trait ClipboardBackend {
     fn set_text(&mut self, text: &str) -> Result<(), String>;
@@ -49,17 +88,111 @@ impl ClipboardBackend for ArboardBackend {
     }
 }
 
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+enum ColorFormat {
+    Hex,
+    Rgb,
+    Hsl,
+    RgbModern,
+    HslModern,
+}
+
+impl Default for ColorFormat {
+    fn default() -> Self {
+        Self::Hex
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 struct PaletteData {
     colors: Vec<[u8; 3]>,
+    #[serde(default)]
+    format: ColorFormat,
+    #[serde(default = "default_dark_mode")]
+    dark_mode: bool,
+}
+
+fn default_dark_mode() -> bool {
+    true
 }
 
 impl Default for PaletteData {
     fn default() -> Self {
         Self {
             colors: Vec::new(),
+            format: ColorFormat::default(),
+            dark_mode: true,
         }
     }
+}
+
+fn format_color(color: [u8; 3], format: &ColorFormat) -> String {
+    match format {
+        ColorFormat::Hex => format!("#{:02X}{:02X}{:02X}", color[0], color[1], color[2]),
+        ColorFormat::Rgb => format!("rgb({}, {}, {})", color[0], color[1], color[2]),
+        ColorFormat::Hsl => {
+            let (h, s, l) = rgb_to_hsl(color[0], color[1], color[2]);
+            format!("hsl({}, {}%, {}%)", h, s, l)
+        }
+        ColorFormat::RgbModern => format!("rgb({} {} {})", color[0], color[1], color[2]),
+        ColorFormat::HslModern => {
+            let (h, s, l) = rgb_to_hsl(color[0], color[1], color[2]);
+            format!("hsl({} {}% {}%)", h, s, l)
+        }
+    }
+}
+
+fn rgb_to_hsl(r: u8, g: u8, b: u8) -> (u32, u32, u32) {
+    let r = r as f64 / 255.0;
+    let g = g as f64 / 255.0;
+    let b = b as f64 / 255.0;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let l = (max + min) / 2.0;
+
+    if (max - min).abs() < f64::EPSILON {
+        return (0, 0, (l * 100.0).round() as u32);
+    }
+
+    let d = max - min;
+    let s = if l > 0.5 {
+        d / (2.0 - max - min)
+    } else {
+        d / (max + min)
+    };
+
+    let h = if max == r {
+        ((g - b) / d + if g < b { 6.0 } else { 0.0 }) / 6.0
+    } else if max == g {
+        ((b - r) / d + 2.0) / 6.0
+    } else {
+        ((r - g) / d + 4.0) / 6.0
+    };
+
+    (
+        (h * 360.0).round() as u32,
+        (s * 100.0).round() as u32,
+        (l * 100.0).round() as u32,
+    )
+}
+
+fn draw_swatch(ui: &mut egui::Ui, id: egui::Id, color: [u8; 3], box_size: f32) -> (bool, bool) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(box_size, box_size), egui::Sense::click());
+    let response = ui.interact(rect, id, egui::Sense::click());
+
+    let painter = ui.painter();
+    painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(color[0], color[1], color[2]));
+
+    if response.hovered() {
+        painter.rect_stroke(
+            rect,
+            4.0,
+            egui::Stroke::new(2.0_f32, ui.visuals().hyperlink_color),
+            egui::StrokeKind::Inside,
+        );
+    }
+
+    (response.clicked(), response.secondary_clicked())
 }
 
 struct App {
@@ -67,16 +200,22 @@ struct App {
     status: String,
     receiver: Option<mpsc::Receiver<String>>,
     clipboard: Box<dyn ClipboardBackend>,
+    editing_color: Option<usize>,
+    ui_initialized: bool,
+    startup_focus: Option<u64>,
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(startup_focus: Option<u64>) -> Self {
         let palette = Self::load_colors();
         Self {
             palette,
             status: String::new(),
             receiver: None,
             clipboard: Box::new(WlCopyBackend),
+            editing_color: None,
+            ui_initialized: false,
+            startup_focus,
         }
     }
 
@@ -115,14 +254,16 @@ impl App {
         let (tx, rx) = mpsc::channel();
         self.receiver = Some(rx);
         self.status = "Picking...".into();
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Transparent(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
 
+        let startup_focus = self.startup_focus;
         std::thread::spawn(move || {
-            let result = match Command::new("niri")
-                .args(["msg", "pick-color"])
-                .output()
-            {
+            let focus_before = niri_focused_window_id();
+            let mut ran = false;
+            let result = match Command::new("niri").args(["msg", "pick-color"]).output() {
                 Ok(output) => {
+                    ran = output.status.success();
                     let stdout = String::from_utf8_lossy(&output.stdout);
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     if !output.status.success() {
@@ -133,6 +274,9 @@ impl App {
                 }
                 Err(e) => format!("Command error: {}", e),
             };
+            if ran {
+                restore_focus(startup_focus.or(focus_before), focus_before);
+            }
             let _ = tx.send(result);
         });
     }
@@ -153,37 +297,70 @@ impl App {
         }
     }
 
-    fn to_hex(color: [u8; 3]) -> Option<String> {
-        Some(format!("#{:02X}{:02X}{:02X}", color[0], color[1], color[2]))
+    fn copy_color(&mut self, color: [u8; 3]) {
+        let text = format_color(color, &self.palette.format);
+        match self.clipboard.set_text(&text) {
+            Ok(_) => self.status = format!("Copied: {}", text),
+            Err(e) => self.status = format!("Clipboard error: {}", e),
+        }
     }
 }
 
 impl eframe::App for App {
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        if self.receiver.is_some() {
+            // Picking: nothing is painted, the window must be fully see-through.
+            [0.0, 0.0, 0.0, 0.0]
+        } else {
+            visuals.panel_fill.to_normalized_gamma_f32()
+        }
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if let Some(rx) = &self.receiver {
-            if let Ok(output) = rx.try_recv() {
-                self.receiver = None;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                if output.starts_with("Error:") || output.starts_with("Command error:") {
-                    self.status = output;
-                } else if let Some(color) = Self::parse_color(&output) {
-                    if let Some(hex) = Self::to_hex(color) {
-                                    match self.clipboard.set_text(&hex) {
-                            Ok(_) => self.status = format!("Copied: {}", hex),
-                            Err(e) => self.status = format!("Clipboard error: {}", e),
-                        }
-                        self.palette.colors.insert(0, color);
-                        if self.palette.colors.len() > MAX_COLORS {
-                            self.palette.colors.pop();
-                        }
-                        self.save_colors();
-                    }
-                } else {
-                    self.status = format!("Parse error: {}", output);
-                }
+        if !self.ui_initialized {
+            self.ui_initialized = true;
+            ctx.set_zoom_factor(UI_ZOOM);
+            ctx.set_theme(if self.palette.dark_mode {
+                egui::Theme::Dark
             } else {
-                ctx.request_repaint();
+                egui::Theme::Light
+            });
+        }
+
+        let received = match &self.receiver {
+            Some(rx) => match rx.try_recv() {
+                Ok(output) => Some(output),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Some("Command error: picker stopped".into())
+                }
+            },
+            None => None,
+        };
+        if let Some(output) = received {
+            self.receiver = None;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Transparent(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
+            if output.starts_with("Error:") || output.starts_with("Command error:") {
+                self.status = output;
+            } else if let Some(color) = Self::parse_color(&output) {
+                self.copy_color(color);
+                if let Some(pos) = self.palette.colors.iter().position(|&c| c == color) {
+                    self.palette.colors.remove(pos);
+                }
+                self.palette.colors.insert(0, color);
+                if self.palette.colors.len() > MAX_COLORS {
+                    self.palette.colors.pop();
+                }
+                self.save_colors();
+            } else {
+                self.status = format!("Parse error: {}", output);
             }
+        }
+
+        if self.receiver.is_some() {
+            ctx.request_repaint();
+            return;
         }
 
         egui::TopBottomPanel::top("btn").show(ctx, |ui| {
@@ -194,6 +371,44 @@ impl eframe::App for App {
             {
                 self.pick_color(ctx);
             }
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_label("Format")
+                    .width(ui.available_width() - 80.0)
+                    .selected_text(format!("{:?}", self.palette.format))
+                    .show_ui(ui, |ui| {
+                        let formats = [
+                            (ColorFormat::Hex, "HEX"),
+                            (ColorFormat::Rgb, "RGB"),
+                            (ColorFormat::Hsl, "HSL"),
+                            (ColorFormat::RgbModern, "RGB Modern"),
+                            (ColorFormat::HslModern, "HSL Modern"),
+                        ];
+                        for (fmt, label) in formats {
+                            if ui
+                                .selectable_value(&mut self.palette.format, fmt.clone(), label)
+                                .clicked()
+                            {
+                                self.save_colors();
+                            }
+                        }
+                    });
+                let theme_label = if self.palette.dark_mode {
+                    "☀"
+                } else {
+                    "🌙"
+                };
+                if ui.button(theme_label).clicked() {
+                    self.palette.dark_mode = !self.palette.dark_mode;
+                    ctx.set_theme(if self.palette.dark_mode {
+                        egui::Theme::Dark
+                    } else {
+                        egui::Theme::Light
+                    });
+                    self.save_colors();
+                }
+            });
+            ui.add_space(4.0);
         });
 
         egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
@@ -205,71 +420,157 @@ impl eframe::App for App {
         });
 
         let box_size = 28.0;
-        let spacing = 4.0;
+        let featured_size = 40.0;
+        let gap = 8.0;
+
+        let mut clicked_color: Option<[u8; 3]> = None;
+        let mut rmb_index: Option<usize> = None;
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    ui.vertical(|ui| {
-                        for (i, color) in self.palette.colors.iter().enumerate() {
-                            let color32 = egui::Color32::from_rgb(color[0], color[1], color[2]);
-                            let hex = Self::to_hex(*color).unwrap_or_default();
+            let colors = self.palette.colors.clone();
+            if colors.is_empty() {
+                return;
+            }
 
-                            ui.horizontal(|ui| {
-                                let (rect, _) = ui.allocate_exact_size(
-                                    egui::vec2(box_size, box_size),
-                                    egui::Sense::click(),
-                                );
+            let labels: Vec<String> = colors
+                .iter()
+                .map(|color| format_color(*color, &self.palette.format))
+                .collect();
 
-                                let response = ui.interact(
-                                    rect,
-                                    egui::Id::new(("color", i)),
-                                    egui::Sense::click(),
-                                );
+            let small = ui
+                .style()
+                .text_styles
+                .get(&egui::TextStyle::Small)
+                .cloned()
+                .unwrap_or(egui::FontId::new(9.0, egui::FontFamily::Proportional));
+            let font_id = egui::FontId::new(small.size, egui::FontFamily::Monospace);
+            let label_width = labels
+                .iter()
+                .map(|label| {
+                    ui.fonts(|fonts| {
+                        fonts
+                            .layout_no_wrap(label.clone(), font_id.clone(), egui::Color32::WHITE)
+                            .size()
+                            .x
+                    })
+                })
+                .fold(0.0_f32, f32::max);
 
-                                let painter = ui.painter();
-                                painter.rect_filled(rect, 4.0, color32);
+            let text_color = ui.visuals().text_color();
 
-                                if response.hovered() {
-                                    painter.rect_stroke(
-                                        rect,
-                                        4.0,
-                                        egui::Stroke::new(
-                                            2.0_f32,
-                                            egui::Color32::WHITE,
-                                        ),
-                                        egui::StrokeKind::Inside,
-                                    );
-                                }
+            // Featured row: the most recent color, alone in its row above the rest.
+            ui.horizontal(|ui| {
+                let (clicked, secondary) =
+                    draw_swatch(ui, egui::Id::new(("color", 0usize)), colors[0], featured_size);
+                if clicked {
+                    clicked_color = Some(colors[0]);
+                }
+                if secondary {
+                    rmb_index = Some(0);
+                }
 
-                                if response.clicked() {
-                        match self.clipboard.set_text(&hex) {
-                                        Ok(_) => self.status = format!("Copied: {}", hex),
-                                        Err(e) => self.status = format!("Clipboard error: {}", e),
+                ui.label(
+                    egui::RichText::new(&labels[0])
+                        .monospace()
+                        .small()
+                        .color(text_color),
+                );
+            });
+
+            if colors.len() > 1 {
+                let cell_width = box_size + 6.0 + label_width;
+                let columns = (((ui.available_width() + gap) / (cell_width + gap)).floor() as usize)
+                    .clamp(1, MAX_COLORS);
+
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        egui::Grid::new("palette")
+                            .num_columns(columns)
+                            .spacing([gap, gap])
+                            .show(ui, |ui| {
+                                for (j, color) in colors[1..].iter().enumerate() {
+                                    if j > 0 && j % columns == 0 {
+                                        ui.end_row();
                                     }
+
+                                    ui.horizontal(|ui| {
+                                        let (clicked, secondary) = draw_swatch(
+                                            ui,
+                                            egui::Id::new(("color", j + 1)),
+                                            *color,
+                                            box_size,
+                                        );
+                                        if clicked {
+                                            clicked_color = Some(*color);
+                                        }
+                                        if secondary {
+                                            rmb_index = Some(j + 1);
+                                        }
+
+                                        ui.label(
+                                            egui::RichText::new(&labels[j + 1])
+                                                .monospace()
+                                                .small()
+                                                .color(text_color),
+                                        );
+                                    });
                                 }
-
-                                ui.label(
-                                    egui::RichText::new(&hex).monospace().small(),
-                                );
                             });
-
-                            ui.add_space(spacing);
-                        }
                     });
-                });
+            }
         });
+
+        if let Some(color) = clicked_color {
+            self.copy_color(color);
+        }
+        if let Some(i) = rmb_index {
+            self.editing_color = Some(i);
+        }
+
+        if let Some(idx) = self.editing_color {
+            let mut open = true;
+            egui::Window::new("Edit Color")
+                .resizable(false)
+                .collapsible(false)
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    let mut new_color = *self.palette.colors.get(idx).unwrap_or(&[0; 3]);
+                    ui.label("Pick a new color:");
+                    let response =
+                        egui::color_picker::color_edit_button_srgb(ui, &mut new_color);
+                    if response.changed() {
+                        if let Some(slot) = self.palette.colors.get_mut(idx) {
+                            *slot = new_color;
+                        }
+                        self.save_colors();
+                        self.copy_color(new_color);
+                    }
+                    ui.add_space(4.0);
+                    if ui.button("Done").clicked() {
+                        self.editing_color = None;
+                    }
+                });
+            if !open {
+                self.editing_color = None;
+            }
+        }
     }
 }
 
 fn main() -> eframe::Result<()> {
+    // Captured before our own window maps: this is the window the user was
+    // working in, and the focus must go back there after a pick.
+    let startup_focus = niri_focused_window_id();
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([200.0, 300.0])
-            .with_min_inner_size([200.0, 300.0])
-            .with_max_inner_size([200.0, 300.0])
+            .with_inner_size([400.0, 500.0])
+            .with_min_inner_size([400.0, 500.0])
+            .with_max_inner_size([400.0, 500.0])
             .with_resizable(false)
+            .with_always_on_top()
+            .with_transparent(true)
             .with_title("Niri Color Picker"),
         ..Default::default()
     };
@@ -277,6 +578,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Niri Color Picker",
         options,
-        Box::new(|_cc| Ok(Box::new(App::new()))),
+        Box::new(move |_cc| Ok(Box::new(App::new(startup_focus)))),
     )
 }

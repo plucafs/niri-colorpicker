@@ -1,7 +1,12 @@
 [package]
-name = "niri-color-picker"
+name = "niri-colorpicker"
 version = "0.1.0"
 edition = "2024"
+description = "A color picker for the niri Wayland compositor"
+license = "MIT"
+repository = "https://github.com/mikomi/niri-colorpicker"
+keywords = ["color", "picker", "niri", "wayland", "gui"]
+categories = ["gui", "graphics"]
 
 [dependencies]
 eframe = "0.31"
@@ -9,3 +14,10 @@ arboard = "3.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 dirs = "6.0"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

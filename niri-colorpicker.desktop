@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Niri Color Picker
+GenericName=Color Picker
+Comment=Pick and manage colors on the niri Wayland compositor
+Exec=niri-colorpicker
+Icon=preferences-color
+Terminal=false
+Categories=Utility;Graphics;
+Keywords=color;picker;eyedropper;

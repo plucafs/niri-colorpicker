@@ -1849,7 +1849,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "niri-color-picker"
+name = "niri-colorpicker"
 version = "0.1.0"
 dependencies = [
  "arboard",
